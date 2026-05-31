@@ -1,0 +1,12 @@
+# Build artifacts — the device app is compiled to .mpy at deploy time
+*.mpy
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local secrets / rendered configs (never committed)
+.config/
+*.local
