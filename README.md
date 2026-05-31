@@ -24,6 +24,10 @@ sustained **hold-Y** gesture that prompt-injection can't synthesize. If the
 device is away, it falls back to the normal terminal prompt — the Cardputer
 is an *optional* gate, never a dependency.
 
+| Ordinary action — one Enter | Destructive action — hold Y |
+|:---:|:---:|
+| ![ordinary approval](docs/approve.jpg) | ![danger confirm](docs/danger.jpg) |
+
 ## Layout
 
 ```
