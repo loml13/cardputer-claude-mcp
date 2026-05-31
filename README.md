@@ -1,4 +1,8 @@
-# cardputer-mcp
+# cardputer-claude-mcp
+
+**English** | [中文](README.zh-CN.md)
+
+![Cardputer-Adv running cardputer-claude-mcp](docs/device.jpg)
 
 Turn an [M5Stack Cardputer-Adv](https://docs.m5stack.com/en/core/Cardputer-Adv)
 into a physical control surface for an AI coding agent.
@@ -56,3 +60,7 @@ mac/README.md             how to install & tune the Mac side  ← start here
 The bridge gates every HTTP request behind a bearer token; tokens live only
 in `~/.config/cardputer-bridge/env` (never committed). The hold-Y confirm
 gesture is the trust anchor for irreversible operations.
+
+## License
+
+[MIT](LICENSE) © 2026 neu
