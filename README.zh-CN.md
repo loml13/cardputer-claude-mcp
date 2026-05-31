@@ -58,6 +58,12 @@ mac/README.md             Mac 端安装与调优说明  ← 从这里开始
 桥接对每个 HTTP 请求都做 bearer-token 鉴权;token 只存在
 `~/.config/cardputer-bridge/env`(从不提交)。"持续按住 Y" 的确认手势是不可逆操作的信任锚。
 
+## 致谢
+
+- 基于 [cardputer-claude-os](https://github.com/dakshaymehta/cardputer-claude-os) —— 本项目所扩展的 Cardputer ↔ Claude BLE 套件。
+- 用量看板灵感来自 [cardputer-claude-usage](https://github.com/chixi4/cardputer-claude-usage)。
+- 花费 / token 数据由 [ccusage](https://github.com/ryoppippi/ccusage) 提供。
+
 ## 许可证
 
 [MIT](LICENSE) © 2026 neu

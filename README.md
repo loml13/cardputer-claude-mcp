@@ -65,6 +65,12 @@ The bridge gates every HTTP request behind a bearer token; tokens live only
 in `~/.config/cardputer-bridge/env` (never committed). The hold-Y confirm
 gesture is the trust anchor for irreversible operations.
 
+## Acknowledgements
+
+- Built on [cardputer-claude-os](https://github.com/dakshaymehta/cardputer-claude-os) — the Cardputer ↔ Claude BLE bundle this extends.
+- Usage dashboard inspired by [cardputer-claude-usage](https://github.com/chixi4/cardputer-claude-usage).
+- Spend / token figures come from [ccusage](https://github.com/ryoppippi/ccusage).
+
 ## License
 
 [MIT](LICENSE) © 2026 neu
