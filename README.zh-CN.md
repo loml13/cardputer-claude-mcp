@@ -41,9 +41,12 @@ mac/README.md             Mac 端安装与调优说明  ← 从这里开始
 
 1. **桥接**:`cd mcp && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`,
    然后运行 `mac/install_cardputer_bridge.sh`(见 [`mac/README.md`](mac/README.md))。
-2. **设备**:app 较大,以 **`.mpy`** 形式部署 —— 用匹配的 `mpy-cross` 编译后上传到
-   `/flash/apps/`,并删除 `.py`(源码形式导入会让 UIFlow 启动器内存溢出崩溃)。
-   它运行在 Cardputer-Adv 的 M5Stack UIFlow 2.0 启动器里。
+2. **设备**:`device/cardputer_mcp.py` **不能单独运行** —— 它要部署进
+   [cardputer-claude-os](https://github.com/dakshaymehta/cardputer-claude-os)
+   的 UIFlow 启动器套件里,由它提供 app 菜单、NimBLE 初始化,以及本 app 的 `run()`
+   依赖的矩阵键盘驱动。把它编译成 **`.mpy`**(用匹配的 `mpy-cross`),放进该套件的
+   `/flash/apps/`,并删除 `.py`(源码形式导入会让启动器内存溢出崩溃)。
+   本仓库**有意只放这个 app,不含那套启动器框架**。
 3. **审批闸门**:在 `~/.claude/settings.json` 里把 `mac/adv_confirm_hook.py` 注册为
    `PreToolUse` hook(片段见 `mac/README.md`)。
 

@@ -44,10 +44,13 @@ mac/README.md             how to install & tune the Mac side  ← start here
 
 1. **Bridge:** `cd mcp && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`,
    then run `mac/install_cardputer_bridge.sh` (see [`mac/README.md`](mac/README.md)).
-2. **Device:** the app is large, so it ships as **`.mpy`** — compile with a
-   matching `mpy-cross` and upload to `/flash/apps/`, deleting the `.py`
-   (importing the source form OOM-crashes the UIFlow launcher). It runs
-   inside the M5Stack UIFlow 2.0 launcher on a Cardputer-Adv.
+2. **Device:** `device/cardputer_mcp.py` is **not standalone** — it deploys
+   into the [cardputer-claude-os](https://github.com/dakshaymehta/cardputer-claude-os)
+   UIFlow launcher bundle, which provides the app menu, NimBLE bring-up, and
+   the matrix-keyboard driver that this app's `run()` relies on. Compile it to
+   **`.mpy`** (matching `mpy-cross`), drop it into that bundle's `/flash/apps/`,
+   and delete the `.py` (importing the source form OOM-crashes the launcher).
+   This repo intentionally ships only the app, not that launcher framework.
 3. **Approval gate:** register `mac/adv_confirm_hook.py` as a `PreToolUse`
    hook in `~/.claude/settings.json` (snippet in `mac/README.md`).
 
