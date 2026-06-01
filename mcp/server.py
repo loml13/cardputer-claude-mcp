@@ -69,6 +69,14 @@ DEFAULT_RPC_TIMEOUT_S = 30.0
 # result instead.
 FAIL_BACKOFF_S = 30.0
 
+# Reconnect watchdog cadence (see _reconnect_watchdog). Fast right after a
+# drop so the daemon links up quickly once the device launches its app, then
+# slow once the device is plainly absent so a powered-off Cardputer never
+# causes continuous scanning.
+RECONNECT_FAST_S = 15.0
+RECONNECT_SLOW_S = 60.0
+RECONNECT_FAST_TRIES = 8  # ~2 min of fast retries before backing off
+
 # Where we remember the device's BLE address after first successful
 # connect. macOS hands out a per-host UUID rather than the real MAC —
 # fine, it's stable across reboots of the laptop.
@@ -793,6 +801,40 @@ async def _usage_refresh_loop() -> None:
         await asyncio.sleep(USAGE_INTERVAL_S)
 
 
+async def _reconnect_watchdog() -> None:
+    """Keep the BLE link up without waiting for the usage tick.
+
+    Idle and effectively free when connected (a periodic boolean check, no
+    radio use). When disconnected it nudges the bridge to reconnect on a
+    fast cadence so the daemon links up within ~15 s of the device launching
+    its app — instead of waiting up to one usage interval — then backs off
+    to a slow cadence if the device stays absent, so a powered-off Cardputer
+    never causes continuous scanning.
+    """
+    _log(
+        f"reconnect watchdog on (fast={int(RECONNECT_FAST_S)}s, "
+        f"slow={int(RECONNECT_SLOW_S)}s)"
+    )
+    misses = 0
+    while True:
+        if bridge.client and bridge.client.is_connected and bridge.hello is not None:
+            misses = 0
+            await asyncio.sleep(RECONNECT_FAST_S)
+            continue
+        # Scan on the watchdog's own cadence rather than the tool-call
+        # backoff (which exists to keep notify/ask/confirm latency low).
+        bridge._last_fail_at = None
+        try:
+            await bridge.ensure_connected()
+            misses = 0
+            _log("reconnect watchdog: linked")
+        except Exception:
+            misses += 1
+        await asyncio.sleep(
+            RECONNECT_FAST_S if misses <= RECONNECT_FAST_TRIES else RECONNECT_SLOW_S
+        )
+
+
 # ---- HTTP transport (the cloud-bridge path, via an MCP tunnel) ------
 
 
@@ -961,11 +1003,13 @@ def main() -> None:
             # (not uvicorn.run, which would spin up its own loop) so the
             # background task and the transport share one event loop.
             usage_task = asyncio.create_task(_usage_refresh_loop())
+            watchdog_task = asyncio.create_task(_reconnect_watchdog())
             config = uvicorn.Config(app, host=host, port=port, log_config=None)
             try:
                 await uvicorn.Server(config).serve()
             finally:
                 usage_task.cancel()
+                watchdog_task.cancel()
 
         asyncio.run(_serve_http())
         return
@@ -974,10 +1018,12 @@ def main() -> None:
     # monitor alongside the stdio transport on one shared loop.
     async def _serve_stdio() -> None:
         usage_task = asyncio.create_task(_usage_refresh_loop())
+        watchdog_task = asyncio.create_task(_reconnect_watchdog())
         try:
             await mcp.run_stdio_async()
         finally:
             usage_task.cancel()
+            watchdog_task.cancel()
 
     asyncio.run(_serve_stdio())
 
