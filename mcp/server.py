@@ -156,6 +156,13 @@ class Bridge:
         # when the user just hasn't powered the device on.
         self._last_fail_at: Optional[float] = None
 
+        # Unsolicited physical-sensor events the device pushes (picked up,
+        # shaken, tapped, loud, …). `_dispatch` enqueues them; the
+        # `await_physical_event` tool drains and waits on them. Bounded
+        # because these are ephemeral "feelings" — if no one is listening,
+        # dropping the oldest is better than growing without limit.
+        self._events: asyncio.Queue = asyncio.Queue(maxsize=64)
+
     # --- connection lifecycle ---------------------------------------
 
     async def ensure_connected(self) -> None:
@@ -330,6 +337,14 @@ class Bridge:
                 # Heartbeats are advisory in iter 2. Iter 3+ will use
                 # them for battery display and DND-state propagation.
                 pass
+            elif ev == "physical":
+                # Device-pushed sensor event (raw, offline). Drop the
+                # oldest if the consumer is slow — a stale backlog is
+                # worse than a gap for "what's happening right now".
+                if self._events.full():
+                    with suppress(asyncio.QueueEmpty):
+                        self._events.get_nowait()
+                self._events.put_nowait(msg)
             else:
                 _log(f"unknown event: {ev}")
             return
@@ -644,6 +659,187 @@ async def confirm(
     if err.startswith("unavailable"):
         return err
     return f"failed: {err}"
+
+
+# ---- physical senses (offline raw -> English interpretation) --------
+#
+# The device reads its BMI270 IMU, MEMS-mic loudness, and battery gauge
+# locally and ships RAW numbers over BLE — it never goes online. Every
+# raw->English mapping happens here on the Mac with plain thresholds (no
+# model, no network), so `sense()` returns a sentence Claude can read
+# directly. Thresholds are a first pass and may want tuning against the
+# real device — especially the MIC_* levels, whose scale depends on the
+# ES8311 codec gain.
+
+# Accel arrives in g (≈1.0 magnitude at rest); gyro in deg/s.
+_STILL_G = 0.06       # |‖accel‖ − 1g| below this (+ low spin) => "still"
+_STILL_SPIN = 12.0    # deg/s below this counts as not rotating
+_MOVING_G = 0.35      # accel deviation above this => actively moved
+_SPIN_FAST = 90.0     # deg/s above this => being turned briskly
+# Mic loudness buckets (raw amplitude RMS; tune after the device probe).
+_MIC_SILENT = 200
+_MIC_QUIET = 800
+_MIC_LOUD = 4000
+
+
+def _orientation(ax, ay, az) -> str:
+    """Coarse resting orientation from the gravity vector (accel in g)."""
+    if az >= 0.7:
+        return "lying flat, face up"
+    if az <= -0.7:
+        return "face down"
+    if ay >= 0.7:
+        return "stood upright"
+    if ay <= -0.7:
+        return "upside down"
+    if ax >= 0.7:
+        return "tipped onto its right edge"
+    if ax <= -0.7:
+        return "tipped onto its left edge"
+    return "held at an angle"
+
+
+def _loudness(mic) -> str:
+    if mic < _MIC_SILENT:
+        return "near silent"
+    if mic < _MIC_QUIET:
+        return "a quiet room"
+    if mic < _MIC_LOUD:
+        return "some ambient sound"
+    return "loud / noisy"
+
+
+def _interpret_senses(d: dict) -> str:
+    """Turn one raw sense snapshot into a sentence. Sensors the device
+    didn't report are simply omitted, so partial firmware still reads
+    cleanly. A compact raw tail is appended for grounding."""
+    parts: list[str] = []
+    raw: list[str] = []
+    ax, ay, az = d.get("ax"), d.get("ay"), d.get("az")
+    gx, gy, gz = d.get("gx"), d.get("gy"), d.get("gz")
+    if None not in (ax, ay, az):
+        mag = (ax * ax + ay * ay + az * az) ** 0.5
+        spin = 0.0
+        if None not in (gx, gy, gz):
+            spin = (gx * gx + gy * gy + gz * gz) ** 0.5
+        dev = abs(mag - 1.0)
+        if dev < _STILL_G and spin < _STILL_SPIN:
+            motion = "perfectly still"
+        elif dev > _MOVING_G or spin > _SPIN_FAST:
+            motion = "being moved around"
+        else:
+            motion = "gently handled"
+        parts.append(f"{_orientation(ax, ay, az)}, {motion}")
+        raw.append(f"accel=({ax:.2f},{ay:.2f},{az:.2f})g")
+        if None not in (gx, gy, gz):
+            raw.append(f"gyro~{spin:.0f}deg/s")
+    mic = d.get("mic")
+    if mic is not None:
+        parts.append(_loudness(mic))
+        raw.append(f"mic={mic}")
+    batt = d.get("batt")
+    if batt is not None:
+        chg = " (charging)" if d.get("chg") else ""
+        if batt >= 60:
+            b = "well charged"
+        elif batt >= 25:
+            b = "around half battery"
+        else:
+            b = "battery running low"
+        parts.append(f"{b} at {batt}%{chg}")
+        raw.append(f"batt={batt}%")
+    if not parts:
+        return "no sensors reported a reading"
+    return f"{'; '.join(parts)}.  [{', '.join(raw)}]"
+
+
+_EVENT_PHRASES = {
+    "picked_up": "The device was just picked up.",
+    "put_down": "The device was just set back down.",
+    "moved": "The device just moved.",
+    "shaken": "The device is being shaken.",
+    "tapped": "Someone just tapped the device.",
+    "dropped": "Whoa — the device was dropped (free-fall detected).",
+    "loud": "A loud sound just happened nearby.",
+}
+
+
+def _interpret_event(msg: dict) -> str:
+    """Turn a pushed physical event into a sentence, with a snapshot if
+    the device attached one."""
+    kind = str(msg.get("kind") or "")
+    phrase = _EVENT_PHRASES.get(kind, f"Physical event: {kind or 'unknown'}.")
+    snapshot = ""
+    if any(k in msg for k in ("ax", "mic", "batt")):
+        snapshot = _interpret_senses(msg)
+    return f"{phrase}  {snapshot}".rstrip()
+
+
+@mcp.tool()
+async def sense(ctx: Context) -> str:
+    """Feel the Cardputer's physical surroundings, right now.
+
+    The Cardputer is a small handheld the user keeps near them. It has a
+    6-axis motion sensor (BMI270), a microphone, and a battery gauge.
+    This reads them ON the device — it never goes online — and returns a
+    plain-language snapshot of the device's physical state: how it's
+    oriented, whether it's still or being moved, how loud the room is,
+    and its battery level.
+
+    Use this to ground yourself in the user's physical world — to notice
+    whether they're holding the device, whether it's noisy around them,
+    or simply out of curiosity about "what's it like there right now".
+
+    Privacy: the microphone is sampled as a loudness LEVEL only — no
+    audio is recorded or transmitted. Returns a sentence such as
+    "lying flat, face up, perfectly still; a quiet room; well charged at
+    82%.  [accel=(0.01,0.02,1.00)g, mic=140, batt=82%]", or
+    'unavailable: <reason>' when the device isn't connected.
+    """
+    result = await bridge.send("sense", {}, rpc_timeout_s=10, agent=_agent_label(ctx))
+    if result.get("ok"):
+        return _interpret_senses(result)
+    err = result.get("err", "unknown")
+    if err.startswith("unavailable"):
+        return err
+    return f"failed: {err}"
+
+
+@mcp.tool()
+async def await_physical_event(ctx: Context, timeout_s: int = 60) -> str:
+    """Wait until something physically happens to the Cardputer.
+
+    BLOCKING — returns as soon as the device detects a notable physical
+    event (it's picked up, set down, shaken, tapped, dropped, or a loud
+    sound happens nearby), or after `timeout_s` seconds if nothing does.
+    The device watches its own sensors locally and pushes the event over
+    BLE; it never goes online, and the mic is used only as a loudness
+    trigger (no audio recorded).
+
+    Use this when you're waiting on the user and want to feel them come
+    back — "tell me when you pick it up" — instead of polling `sense()`
+    in a loop. Returns a sentence describing what happened, or
+    'nothing (timeout)' if the window passed quietly, or
+    'unavailable: <reason>' if the device isn't connected.
+    """
+    if timeout_s < 1 or timeout_s > 600:
+        return "error: timeout_s must be between 1 and 600"
+    # Without a live device the events can never arrive, so fail fast
+    # instead of blocking the whole timeout.
+    try:
+        await bridge.ensure_connected()
+    except ConnectionError as e:
+        return f"unavailable: {e}"
+    # Drop any backlog so we report what happens FROM NOW, not a stale
+    # event from earlier handling.
+    while not bridge._events.empty():
+        with suppress(asyncio.QueueEmpty):
+            bridge._events.get_nowait()
+    try:
+        msg = await asyncio.wait_for(bridge._events.get(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        return "nothing (timeout)"
+    return _interpret_event(msg)
 
 
 # ---- usage monitor (ambient dashboard on the device idle screen) ----

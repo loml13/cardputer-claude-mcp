@@ -59,9 +59,26 @@ _RX_CHAR = (RX_UUID, _FLAG_WRITE | _FLAG_WRITE_NR)
 _TX_CHAR = (TX_UUID, _FLAG_READ | _FLAG_NOTIFY)
 _SVC = (SERVICE_UUID, (_RX_CHAR, _TX_CHAR))
 
-_FW_VERSION = "0.3.0"
-_CAPS = ["notify", "ask", "confirm", "usage"]
+_FW_VERSION = "0.4.0"
+_CAPS = ["notify", "ask", "confirm", "usage", "sense"]
 _MTU = 20  # default ATT MTU minus framing; chunk every TX write at this
+
+# ---- physical-sense tuning -----------------------------------------
+# Cardputer-Adv has a BMI270 6-axis IMU and a battery gauge we read
+# locally (offline) for the `sense` tool and for pushed physical events.
+# Accel is in g (~1.0 magnitude at rest); gyro in deg/s. Thresholds are
+# a first pass — tune against the real device.
+_SENSE_PERIOD_MS = 100      # ~10 Hz IMU sampling inside the main-loop tick
+_EVENT_DEBOUNCE_MS = 1500   # min gap between pushed physical events
+_FREEFALL_G = 0.35          # |accel| below this => free fall / dropped
+_SHAKE_G = 1.0              # accel deviation above this => shaken
+_SHAKE_SPIN = 250.0        # deg/s above this => shaken (fast rotation)
+_MOVE_G = 0.12             # accel deviation above this => being moved
+_MOVE_SPIN = 40.0          # deg/s above this => being moved
+# The MEMS mic shares the I2S bus with the speaker (chirps), so reading
+# it means handing the bus back and forth. Off until the device probe
+# confirms a mic capture doesn't swallow the approval chirp.
+_MIC_ENABLED = False
 
 
 # ---- UI constants --------------------------------------------------
@@ -478,6 +495,13 @@ class App:
         self._anim_next_pick = time.ticks_add(now0, 1500)
         self._anim_last_paint = 0
 
+        # Physical-sense sampling state (BMI270 read in the main-loop tick).
+        self._sense_next_at = now0
+        self._was_moving = False
+        self._last_event_at = now0
+        self._last_dev = 0.0    # latest accel deviation (drives mascot mood)
+        self._last_spin = 0.0   # latest gyro magnitude, deg/s
+
         # Ask state.
         self.pending_ask = None  # {"id", "question", "choices", "deadline"}
 
@@ -520,6 +544,8 @@ class App:
             self._cmd_confirm(msg, mid)
         elif cmd == "usage":
             self._cmd_usage(msg, mid)
+        elif cmd == "sense":
+            self._cmd_sense(msg, mid)
         elif cmd == "ping":
             self.ble.send({"ack": "ping", "id": mid, "ok": True})
         elif cmd == "cancel":
@@ -846,6 +872,12 @@ class App:
                 self.state = "idle"
                 self._dirty = True
 
+        # Physical senses: sample the IMU at ~10 Hz, update the mascot
+        # mood, and push notable events to the host. Cheap and offline;
+        # runs in every state but only emits on a real, debounced
+        # transition while a host is listening.
+        self._sense_tick(now)
+
         if self._dirty:
             self.redraw()
             self._dirty = False
@@ -855,6 +887,79 @@ class App:
         # immediately followed by an animated frame.
         if self.state == "idle":
             self._animate_mascot(now)
+
+    def _sense_tick(self, now):
+        """Sample the IMU on a throttle; cache motion for the mascot and
+        push debounced physical events to the host. No-op without an IMU."""
+        if time.ticks_diff(now, self._sense_next_at) < 0:
+            return
+        self._sense_next_at = time.ticks_add(now, _SENSE_PERIOD_MS)
+        imu = _read_imu()
+        if imu is None:
+            return
+        ax, ay, az, gx, gy, gz = imu
+        mag = (ax * ax + ay * ay + az * az) ** 0.5
+        dev = abs(mag - 1.0)
+        spin = (gx * gx + gy * gy + gz * gz) ** 0.5
+        self._last_dev = dev      # consumed by _animate_mascot (mood)
+        self._last_spin = spin
+
+        # Classify, strongest first. moving feeds the pickup/putdown edges.
+        kind = None
+        if mag < _FREEFALL_G:
+            kind = "dropped"
+        elif dev > _SHAKE_G or spin > _SHAKE_SPIN:
+            kind = "shaken"
+        moving = dev > _MOVE_G or spin > _MOVE_SPIN
+        if kind is None:
+            if moving and not self._was_moving:
+                kind = "picked_up"
+            elif (not moving) and self._was_moving:
+                kind = "put_down"
+        self._was_moving = moving
+
+        if kind is None:
+            return
+        if time.ticks_diff(now, self._last_event_at) < _EVENT_DEBOUNCE_MS:
+            return
+        self._last_event_at = now
+        # Embodiment: Clawd perks up and hops the moment the device is
+        # handled, so the mascot visibly reacts to the physical world even
+        # with no host listening. put_down just lets it settle back to its
+        # idle rotation (which already includes the sleep emote).
+        if kind in ("picked_up", "moved", "shaken", "dropped"):
+            self._anim_emote = "hop"
+            self._anim_t0 = now
+            self._anim_until = time.ticks_add(now, _EMOTE_MS["hop"])
+            self._anim_next_pick = time.ticks_add(now, _EMOTE_MS["hop"] + 600)
+        if self.ble_connected:
+            self.ble.send({
+                "event": "physical", "kind": kind,
+                "ax": round(ax, 3), "ay": round(ay, 3), "az": round(az, 3),
+            })
+
+    def _cmd_sense(self, msg, mid):
+        """Snapshot the physical sensors and ack the raw values.
+
+        Offline: reads the BMI270 IMU and battery gauge (and mic level
+        when enabled) locally and returns numbers; the host turns them
+        into a sentence. Missing sensors are omitted so the host degrades.
+        """
+        out = {"ack": "sense", "id": mid, "ok": True}
+        imu = _read_imu()
+        if imu is not None:
+            ax, ay, az, gx, gy, gz = imu
+            out["ax"], out["ay"], out["az"] = round(ax, 3), round(ay, 3), round(az, 3)
+            out["gx"], out["gy"], out["gz"] = round(gx, 2), round(gy, 2), round(gz, 2)
+        mic = _read_mic()
+        if mic is not None:
+            out["mic"] = mic
+        pct, chg = _read_batt()
+        if pct is not None:
+            out["batt"] = pct
+            if chg is not None:
+                out["chg"] = chg
+        self.ble.send(out)
 
     def _animate_mascot(self, now):
         # Pick a fresh emote when the idle gap elapses; otherwise fall back
@@ -1391,6 +1496,86 @@ def _chirp(urgency):
         # Common failure: the build's Speaker API is shaped differently.
         # Iter 3 can probe and adapt; for now silence is acceptable.
         print("cardputer_mcp: chirp skipped:", e)
+
+
+# ---- physical-sense readers ----------------------------------------
+#
+# All offline: the BMI270 IMU and battery gauge are read locally and
+# returned as raw numbers. Each is guarded so a build/variant lacking a
+# given sensor (the original Cardputer has no IMU) degrades to None
+# rather than raising.
+
+
+def _read_imu():
+    """(ax, ay, az, gx, gy, gz) in g / deg-per-s, or None if no IMU.
+
+    Cardputer-Adv carries a BMI270; M5.begin() (run in boot.py) brings it
+    up and exposes it as M5.Imu, whose getAccel()/getGyro() each return a
+    3-tuple. If the API is shaped differently on a future build this
+    returns None and the sense layer simply omits motion.
+    """
+    try:
+        imu = M5.Imu
+        ax, ay, az = imu.getAccel()
+        gx, gy, gz = imu.getGyro()
+        return (ax, ay, az, gx, gy, gz)
+    except Exception:
+        return None
+
+
+def _read_batt():
+    """(battery_pct, charging_bool_or_None), or (None, None)."""
+    try:
+        pct = M5.Power.getBatteryLevel()
+    except Exception:
+        return (None, None)
+    try:
+        chg = bool(M5.Power.isCharging())
+    except Exception:
+        chg = None
+    return (pct, chg)
+
+
+def _read_mic():
+    """Ambient loudness as a raw RMS amplitude, or None.
+
+    The MEMS mic shares the I2S bus with the speaker, so a capture means
+    taking the bus from the speaker and handing it back after. Gated by
+    _MIC_ENABLED until the device probe confirms a read doesn't swallow
+    the approval chirp. Privacy: only an RMS level is computed — no audio
+    is kept or transmitted.
+    """
+    if not _MIC_ENABLED:
+        return None
+    try:
+        import array
+        mic = M5.Mic
+        try:
+            M5.Speaker.end()
+        except Exception:
+            pass
+        if not mic.isEnabled():
+            mic.begin()
+        buf = bytearray(512)
+        mic.record(buf, 16000, False)
+        for _ in range(20):
+            if not mic.isRecording():
+                break
+            time.sleep_ms(5)
+        samples = array.array("h", buf)
+        acc = 0
+        for v in samples:
+            acc += v * v
+        rms = int((acc / len(samples)) ** 0.5)
+        try:
+            mic.end()
+        except Exception:
+            pass
+        return rms
+    except Exception:
+        return None
+    finally:
+        _speaker_power_on()
 
 
 # ---- main loop ------------------------------------------------------
