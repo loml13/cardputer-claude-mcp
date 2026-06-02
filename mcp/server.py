@@ -63,6 +63,11 @@ SCAN_TIMEOUT_S = 5.0
 HELLO_TIMEOUT_S = 5.0
 DEFAULT_RPC_TIMEOUT_S = 30.0
 
+# Commands that put a blocking modal on the device's single screen. These
+# are serialized (see Bridge.send / _modal_lock) so concurrent agents'
+# prompts queue instead of pre-empting one another on the one display.
+_MODAL_CMDS = frozenset({"ask", "confirm"})
+
 # When connection fails, suppress retries for this long so we don't
 # stall every tool call with a fresh 5-second scan when the device
 # is simply not in range. The MCP client will see a fast "unavailable"
@@ -162,6 +167,12 @@ class Bridge:
         # because these are ephemeral "feelings" — if no one is listening,
         # dropping the oldest is better than growing without limit.
         self._events: asyncio.Queue = asyncio.Queue(maxsize=64)
+
+        # Serializes blocking modal interactions (ask/confirm) so two
+        # agents sharing this one daemon can't put overlapping prompts on
+        # the device's single screen. Held for the whole modal RPC; see
+        # send().
+        self._modal_lock = asyncio.Lock()
 
     # --- connection lifecycle ---------------------------------------
 
@@ -371,6 +382,29 @@ class Bridge:
     # --- outbound RPC ------------------------------------------------
 
     async def send(
+        self,
+        cmd: str,
+        payload: dict,
+        rpc_timeout_s: float = DEFAULT_RPC_TIMEOUT_S,
+        agent: str = "mcp-client",
+    ) -> dict:
+        """Send one command, await its ack (see _send_one for the body).
+
+        Modal commands (ask/confirm) are serialized through `_modal_lock`
+        so two agents sharing this one daemon can't put overlapping
+        prompts on the device's single screen. Without it, a later prompt
+        pre-empts an earlier one on the device and the earlier RPC
+        resolves as a spurious `cancelled` even though the user was
+        answering it — the "I pressed Enter but it said cancelled"
+        multi-agent bug. Non-modal commands (notify/usage/sense/ping) are
+        fast and fire concurrently, so they skip the lock.
+        """
+        if cmd in _MODAL_CMDS:
+            async with self._modal_lock:
+                return await self._send_one(cmd, payload, rpc_timeout_s, agent)
+        return await self._send_one(cmd, payload, rpc_timeout_s, agent)
+
+    async def _send_one(
         self,
         cmd: str,
         payload: dict,
