@@ -340,6 +340,12 @@ def main() -> None:
     # "ask" -> terminal fallback when it isn't. MCP reads and any unrecognized
     # tool defer silently, so they never buzz the device.
     if tool and tool.startswith("mcp__"):
+        # The cardputer MCP server IS the approval device. Gating its own
+        # tools through itself is circular — notify would buzz to ask
+        # permission to buzz, and confirm would nest a modal inside the
+        # modal it's trying to raise — so always defer them.
+        if tool.startswith("mcp__cardputer__"):
+            _defer()
         if _is_mcp_readonly(tool):
             _defer()
         decision, reason = _ask_device(_other_title(tool, tool_input), danger=False)

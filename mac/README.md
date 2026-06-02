@@ -49,24 +49,29 @@ claude mcp add --transport http cardputer \
 
 ## 2. Approval gate (`adv_confirm_hook.py`)
 
-A `PreToolUse` hook that intercepts **Bash** and **file-edit**
-(`Write` / `Edit` / `MultiEdit` / `NotebookEdit`) tool calls and asks for
-approval **on the Cardputer** before they run. It talks to the bridge
-daemon's `POST /hook/confirm` route, which drives the device gesture and
-returns the verdict.
+A `PreToolUse` hook that intercepts side-effecting tool calls — **Bash**,
+**file edits** (`Write` / `Edit` / `MultiEdit` / `NotebookEdit`),
+**WebFetch** / **WebSearch** / **Task** / **KillShell**, and **MCP** write
+tools — and asks for approval **on the Cardputer** before they run.
+Read-only tools (and read-ish MCP calls — `*_search`, `*_get`, `*_diff`, …)
+pass through untouched, and the cardputer server's own tools always defer
+(gating the approval device through itself would be circular). It talks to
+the bridge daemon's `POST /hook/confirm` route, which drives the device
+gesture and returns the verdict.
 
 ### Tiers
 
 | Tier | What | Gesture on the ADV |
 |------|------|--------------------|
 | **Whitelist** | read-only commands (`ls`, `cat`, `grep`, `git status`, …) | none — passes straight through |
-| **Light** | ordinary commands / file edits | a single **Enter** tap (bright 3-note chirp) |
-| **Danger** | `rm -rf`, `git push`, `sudo`, secret/key/system paths, … | sustained **hold-Y** (~3 s, triple chirp) |
+| **Light** | ordinary commands, file edits, web/task/MCP-write tools | a single **Enter** tap (bright 3-note chirp) |
+| **Danger** | `rm -rf`, `git push`, `sudo`, secret/key/system paths, … | a single **Y** press (triple chirp) |
 
-The danger gesture is injection-resistant on purpose: no amount of tool
-output or prompt injection can synthesize a sustained burst of physical key
-events. Risky patterns are checked **first**, so a chained command like
-`ls && rm -rf x` is treated as danger.
+Both gestures are injection-resistant on purpose: no amount of tool output
+or prompt injection can synthesize a physical keypress. The danger tier
+just uses a distinct key (**Y**) from the light tier's **Enter** so the two
+can't be confused. Risky patterns are checked **first**, so a chained
+command like `ls && rm -rf x` is treated as danger.
 
 ### Graceful when the device is away
 
@@ -84,7 +89,7 @@ Register it in `~/.claude/settings.json`:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|WebFetch|WebSearch|Task|KillShell|mcp__.*",
         "hooks": [
           { "type": "command",
             "command": "python3 /absolute/path/to/mac/adv_confirm_hook.py" }
@@ -103,7 +108,7 @@ Drop any of these next to the env file to override the built-in defaults
 (one regex per line; `#` comments allowed):
 
 - `~/.config/cardputer-bridge/safe_patterns.txt` — whitelist
-- `~/.config/cardputer-bridge/risky_patterns.txt` — danger / hold-Y
+- `~/.config/cardputer-bridge/risky_patterns.txt` — danger patterns
 - `~/.config/cardputer-bridge/sensitive_paths.txt` — file paths that make an
   edit "danger"
 
