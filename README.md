@@ -19,12 +19,13 @@ bridge, so an agent (Claude Code, etc.) can:
 
 The headline trick is the **approval gate**: routine commands pass through a
 whitelist, ordinary ones take a single **Enter** on the device, and
-destructive ones (`rm -rf`, `git push`, `sudo`, edits to secrets) require a
-sustained **hold-Y** gesture that prompt-injection can't synthesize. If the
-device is away, it falls back to the normal terminal prompt — the Cardputer
-is an *optional* gate, never a dependency.
+destructive ones (`rm -rf`, `git push`, `sudo`, edits to secrets) take a
+single **Y** press — a different key from the ordinary prompt's Enter, and a
+physical keypress that prompt-injection can't synthesize. If the device is
+away, it falls back to the normal terminal prompt — the Cardputer is an
+*optional* gate, never a dependency.
 
-| Ordinary action — one Enter | Destructive action — hold Y |
+| Ordinary action — press Enter | Destructive action — press Y |
 |:---:|:---:|
 | ![ordinary approval](docs/approve.jpg) | ![danger confirm](docs/danger.jpg) |
 
@@ -65,8 +66,8 @@ mac/README.md             how to install & tune the Mac side  ← start here
 ## Security
 
 The bridge gates every HTTP request behind a bearer token; tokens live only
-in `~/.config/cardputer-bridge/env` (never committed). The hold-Y confirm
-gesture is the trust anchor for irreversible operations.
+in `~/.config/cardputer-bridge/env` (never committed). A physical Y press on
+the device is the trust anchor for irreversible operations.
 
 ## Acknowledgements
 

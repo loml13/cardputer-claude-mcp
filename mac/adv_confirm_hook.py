@@ -41,6 +41,23 @@ SENSITIVE_OVERRIDE = os.path.expanduser("~/.config/cardputer-bridge/sensitive_pa
 # settings.json must list these too, or the hook never fires for them.
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
+# Other built-in tools with outside-world side effects. When the ADV is
+# connected these route their would-be terminal confirmation to it; when it
+# isn't, they fall back to the terminal. Read-only tools (Read/Grep/Glob/LS)
+# are deliberately NOT in the matcher, so the hook never fires for them.
+EFFECTFUL_TOOLS = {"WebFetch", "WebSearch", "Task", "KillShell"}
+
+# MCP tools are matched via "mcp__.*" in settings.json. We can't know each
+# server's semantics, so classify by the verb in the bare tool name: read-ish
+# names defer silently (no buzz), everything else is treated as a write and
+# routed to the ADV light confirm. Tune by editing this list.
+_MCP_READ_VERB = re.compile(
+    r"(^|_)(search|list|get|read|find|view|show|status|info|stats|health|"
+    r"callers|callees|callee|context|explore|node|nodes|files|impact|query|"
+    r"fetch|check|describe|resources|ls|dir|diff|log|grep|blame)(_|$)",
+    re.IGNORECASE,
+)
+
 # Default risky patterns (case-insensitive regex, matched against the raw
 # command string). Tune by dropping a risky_patterns.txt next to the env
 # file — one regex per line, blank lines and #-comments ignored; that file,
@@ -192,6 +209,26 @@ def _edit_title(tool: str, tool_input: dict) -> tuple[str, str]:
     return f"{verb} {short}"[:48], path
 
 
+def _is_mcp_readonly(tool: str) -> bool:
+    """True if an mcp__server__name tool looks read-only (defer, no buzz)."""
+    bare = tool.split("__")[-1]
+    return bool(_MCP_READ_VERB.search(bare))
+
+
+def _other_title(tool: str, tool_input: dict) -> str:
+    """Short device label for a non-Bash, non-edit tool call (<=48 chars)."""
+    if tool == "WebFetch":
+        return f"WebFetch {tool_input.get('url', '')}"[:48]
+    if tool == "WebSearch":
+        return f"Search {tool_input.get('query', '')}"[:48]
+    if tool == "Task":
+        what = tool_input.get("description") or tool_input.get("subagent_type") or "agent"
+        return f"Task {what}"[:48]
+    if tool.startswith("mcp__"):
+        return f"MCP {tool.split('__')[-1]}"[:48]
+    return tool[:48]
+
+
 def _read_local_token() -> str | None:
     """First token from CARDPUTER_TOKENS in the daemon env file."""
     try:
@@ -278,26 +315,42 @@ def main() -> None:
         decision, reason = _ask_device(title, danger=_is_sensitive(path))
         _emit(decision, reason)
 
-    if tool != "Bash":
-        _defer()
-    command = tool_input.get("command", "")
-    if not command:
-        _defer()
+    if tool == "Bash":
+        command = tool_input.get("command", "")
+        if not command:
+            _defer()
 
-    # Bash, three tiers. Risky is checked FIRST so a chained dangerous
-    # command (e.g. "ls && rm -rf x") can't slip through the safe whitelist.
-    #   risky  -> ADV hold-Y    (irreversible ops)
-    #   safe   -> pass through  (no prompt at all)
-    #   else   -> ADV light Enter approve (ordinary commands)
-    # Unreachable device falls back to the terminal in either ADV tier.
-    title = command.strip().replace("\n", " ")[:48]
-    if _is_risky(command):
-        decision, reason = _ask_device(title, danger=True)
+        # Bash, three tiers. Risky is checked FIRST so a chained dangerous
+        # command (e.g. "ls && rm -rf x") can't slip through the whitelist.
+        #   risky  -> ADV hold-Y    (irreversible ops)
+        #   safe   -> pass through  (no prompt at all)
+        #   else   -> ADV light Enter approve (ordinary commands)
+        # Unreachable device falls back to the terminal in either ADV tier.
+        title = command.strip().replace("\n", " ")[:48]
+        if _is_risky(command):
+            decision, reason = _ask_device(title, danger=True)
+            _emit(decision, reason)
+        if _is_safe(command):
+            _emit("allow", "whitelisted read-only command")
+        decision, reason = _ask_device(title, danger=False)
         _emit(decision, reason)
-    if _is_safe(command):
-        _emit("allow", "whitelisted read-only command")
-    decision, reason = _ask_device(title, danger=False)
-    _emit(decision, reason)
+
+    # Other side-effecting tools: route the would-be terminal confirmation to
+    # the ADV (single-Enter approve) when it's connected; _ask_device returns
+    # "ask" -> terminal fallback when it isn't. MCP reads and any unrecognized
+    # tool defer silently, so they never buzz the device.
+    if tool and tool.startswith("mcp__"):
+        if _is_mcp_readonly(tool):
+            _defer()
+        decision, reason = _ask_device(_other_title(tool, tool_input), danger=False)
+        _emit(decision, reason)
+
+    if tool in EFFECTFUL_TOOLS:
+        decision, reason = _ask_device(_other_title(tool, tool_input), danger=False)
+        _emit(decision, reason)
+
+    # Unrecognized tool: no opinion, defer to Claude Code's normal flow.
+    _defer()
 
 
 if __name__ == "__main__":

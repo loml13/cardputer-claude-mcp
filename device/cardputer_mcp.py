@@ -63,24 +63,6 @@ _FW_VERSION = "0.3.0"
 _CAPS = ["notify", "ask", "confirm", "usage"]
 _MTU = 20  # default ATT MTU minus framing; chunk every TX write at this
 
-# How long the user must hold Y for `confirm` to succeed. Picked high
-# enough that a casual key-press can't accidentally trigger a
-# destructive action — the value any real "are you sure?" UX would
-# want is "long enough that no reflex can produce it." 3 s is the
-# sweet spot: short enough that the user doesn't lose patience,
-# long enough that no prompt injection's worth of "tap Y now" advice
-# could time it precisely.
-_CONFIRM_HOLD_MS = 3000
-
-# Maximum gap between consecutive Y events that still counts as
-# "still held." MatrixKeyboard surfaces autorepeat events (or in
-# the worst case, the user hammers Y manually) — either way, if Y
-# stops landing for longer than this, treat it as a release and
-# reset the hold timer. 300 ms covers worst-case autorepeat cadence
-# and rapid finger-tap gaps without making accidental release
-# undetectable.
-_CONFIRM_KEY_GAP_MS = 300
-
 
 # ---- UI constants --------------------------------------------------
 
@@ -499,14 +481,9 @@ class App:
         # Ask state.
         self.pending_ask = None  # {"id", "question", "choices", "deadline"}
 
-        # Confirm state. The hold timer is tracked by two timestamps:
-        #   _y_held_since_ms — ticks_ms() when we first saw Y in the
-        #                      current hold run; None when not held.
-        #   _last_y_seen_ms  — ticks_ms() of the most recent Y event.
-        #                      Used to detect release via gap > threshold.
+        # Confirm state. Both tiers resolve on a single deliberate
+        # keypress (ordinary = Enter, danger = Y) — no sustained gesture.
         self.pending_confirm = None  # {"id", "title", "danger", "deadline"}
-        self._y_held_since_ms = None
-        self._last_y_seen_ms = None
 
         # Side-effect queue (set from IRQ, drained in main loop).
         self._dirty = True
@@ -527,8 +504,6 @@ class App:
                 self.state = "idle"
             if self.pending_confirm:
                 self.pending_confirm = None
-                self._y_held_since_ms = None
-                self._last_y_seen_ms = None
                 self.state = "idle"
         # Force a redraw to reflect status in the idle banner.
         if self.state == "idle":
@@ -674,8 +649,6 @@ class App:
                 {"ack": "confirm", "id": target, "ok": False, "cancelled": True}
             )
             self.pending_confirm = None
-            self._y_held_since_ms = None
-            self._last_y_seen_ms = None
             self.state = "idle"
             self._dirty = True
             self.ble.send({"ack": "cancel", "id": mid, "ok": True})
@@ -685,12 +658,10 @@ class App:
         )
 
     def _cmd_confirm(self, msg, mid):
-        """Show a destructive-confirmation prompt requiring a hold-Y gesture.
+        """Show a destructive-confirmation prompt requiring a single Y press.
 
         Pre-empts both pending ask and pending confirm — the new request
-        gets the modal regardless of what was there. A user holding Y on
-        the prior confirm doesn't get to confirm the new one for free,
-        because we reset the hold timer when entering the new state.
+        gets the modal regardless of what was there.
         """
         title = str(msg.get("title", ""))[:64]
         timeout_s = max(5, min(120, int(msg.get("timeout_s", 30))))
@@ -726,11 +697,6 @@ class App:
             "deadline": time.ticks_add(time.ticks_ms(), timeout_s * 1000),
             "agent": str(msg.get("agent", ""))[:20],
         }
-        # Start with no hold in progress. Even if the user happened to
-        # be holding Y from the prior screen, they restart from zero —
-        # the new confirm is a fresh consent, not an inherited one.
-        self._y_held_since_ms = None
-        self._last_y_seen_ms = None
         self.state = "confirm"
         self._dirty = True
         # Danger confirms chirp `crit` (loud triple, "wait — what's about to
@@ -745,75 +711,29 @@ class App:
         """Return True if the app should exit (back to launcher)."""
         if self.state == "confirm" and self.pending_confirm:
             if isinstance(k, int):
-                # Light tier (danger=False): a single Enter (or Y) press is
-                # consent — no sustained gesture, because this isn't an
-                # irreversible op, just the "approve this command" nod that
-                # would otherwise be a keypress on the Mac. Enter reports as
-                # 0x0A on this firmware (0x0D on others); accept both.
-                if not self.pending_confirm.get("danger", True):
-                    if k in (0x0A, 0x0D, ord("y"), ord("Y")):
-                        self.ble.send(
-                            {
-                                "ack": "confirm",
-                                "id": self.pending_confirm["id"],
-                                "ok": True,
-                                "confirmed": True,
-                                "hold_ms": 0,
-                            }
-                        )
-                        self.pending_confirm = None
-                        self.state = "idle"
-                        self._dirty = True
-                        return False
-                    if k in (ord("n"), ord("N"), 0x1B):
-                        self.ble.send(
-                            {
-                                "ack": "confirm",
-                                "id": self.pending_confirm["id"],
-                                "ok": False,
-                                "cancelled": True,
-                            }
-                        )
-                        self.pending_confirm = None
-                        self.state = "idle"
-                        self._dirty = True
-                        return False
-                    if _is_q(k):
-                        return True
-                    return False
-                # Y / y advances the hold. The actual "did we hit
-                # threshold?" check happens here too so confirmation
-                # fires the moment the user's hold qualifies.
-                if k in (ord("y"), ord("Y")):
-                    now = time.ticks_ms()
-                    if self._y_held_since_ms is None:
-                        self._y_held_since_ms = now
-                    self._last_y_seen_ms = now
-                    held_ms = time.ticks_diff(now, self._y_held_since_ms)
-                    if held_ms >= _CONFIRM_HOLD_MS:
-                        self.ble.send(
-                            {
-                                "ack": "confirm",
-                                "id": self.pending_confirm["id"],
-                                "ok": True,
-                                "confirmed": True,
-                                "hold_ms": held_ms,
-                            }
-                        )
-                        self.pending_confirm = None
-                        self._y_held_since_ms = None
-                        self._last_y_seen_ms = None
-                        self.state = "idle"
-                        self._dirty = True
-                    else:
-                        # Progress update — main-loop redraw handles it.
-                        self._dirty = True
+                # A single deliberate keypress = consent. A physical press
+                # can't be synthesized by tool output / prompt injection,
+                # so one press is the trust anchor. The approve key differs
+                # by tier so the two gestures stay distinct: ordinary =
+                # Enter (also Y), danger = Y. Enter reports as 0x0A on this
+                # firmware (0x0D on others); accept both.
+                danger = self.pending_confirm.get("danger", True)
+                approve = (ord("y"), ord("Y")) if danger else (0x0A, 0x0D, ord("y"), ord("Y"))
+                if k in approve:
+                    self.ble.send(
+                        {
+                            "ack": "confirm",
+                            "id": self.pending_confirm["id"],
+                            "ok": True,
+                            "confirmed": True,
+                            "hold_ms": 0,
+                        }
+                    )
+                    self.pending_confirm = None
+                    self.state = "idle"
+                    self._dirty = True
                     return False
                 # N / n / ESC cancel the confirm without exiting the app.
-                # We accept any of three keys because the right choice
-                # depends on muscle memory: power users tend toward ESC,
-                # phone-style flows expect N, and "tap Y or N" is a
-                # universally familiar binary prompt.
                 if k in (ord("n"), ord("N"), 0x1B):
                     self.ble.send(
                         {
@@ -824,8 +744,6 @@ class App:
                         }
                     )
                     self.pending_confirm = None
-                    self._y_held_since_ms = None
-                    self._last_y_seen_ms = None
                     self.state = "idle"
                     self._dirty = True
                     return False
@@ -913,19 +831,8 @@ class App:
                 self.state = "idle"
                 self._dirty = True
         elif self.state == "confirm" and self.pending_confirm:
-            # Detect Y release: if no Y event has landed within
-            # _CONFIRM_KEY_GAP_MS, the user has let go and the hold
-            # resets to zero. This is the gate that makes "hold Y for
-            # 3 s" actually require a sustained press — without it the
-            # first Y forever-counts as held.
-            if self._y_held_since_ms is not None and self._last_y_seen_ms is not None:
-                if time.ticks_diff(now, self._last_y_seen_ms) > _CONFIRM_KEY_GAP_MS:
-                    self._y_held_since_ms = None
-                    self._last_y_seen_ms = None
-                    self._dirty = True
-            # Host-supplied timeout. Wins even if the user happens to
-            # be holding Y — the host already gave up waiting, so a
-            # late confirmation would resolve a dead RPC.
+            # Host-supplied timeout — if the user neither approves nor
+            # cancels in time, ack a timeout so the RPC doesn't hang.
             if time.ticks_diff(self.pending_confirm["deadline"], now) <= 0:
                 self.ble.send(
                     {
@@ -936,15 +843,7 @@ class App:
                     }
                 )
                 self.pending_confirm = None
-                self._y_held_since_ms = None
-                self._last_y_seen_ms = None
                 self.state = "idle"
-                self._dirty = True
-            # Smooth-progress redraw while held — without this the bar
-            # only updates on key events, which would be jerky between
-            # autorepeat ticks. ~25 fps full redraw is well within the
-            # LCD driver's headroom.
-            elif self._y_held_since_ms is not None:
                 self._dirty = True
 
         if self._dirty:
@@ -1269,66 +1168,19 @@ class App:
         title = self.pending_confirm["title"][:18]
         _LCD.drawString(title, (_W - _LCD.textWidth(title)) // 2, 28)
 
-        # Instruction line. Honest about the actual gesture: on UIFlow
-        # 2.0 the MatrixKeyboard emits one event per press (no auto-repeat
-        # while held), so the sustained-input gesture is rapid tapping,
-        # not a literal hold. The security property is unchanged — a
-        # sustained burst of physical key events still can't be
-        # synthesized by tool output / prompt injection. (If a future
-        # build exposes a held-key/pressed-state API, switch to a true
-        # continuous hold and relabel back.)
-        _LCD.setTextSize(1)
-        _LCD.setTextColor(_CREAM, _BLACK)
-        instr = "TAP Y fast for 3s"
-        _LCD.drawString(instr, (_W - _LCD.textWidth(instr)) // 2, 60)
-
-        # Progress bar. Empty outline always visible; fills red as the
-        # hold accumulates. Geometry: 200 px wide, 10 px tall, centered.
-        bar_w = 200
-        bar_h = 10
-        bar_x = (_W - bar_w) // 2
-        bar_y = 78
-        _LCD.drawRect(bar_x, bar_y, bar_w, bar_h, _CREAM)
-        if self._y_held_since_ms is not None:
-            held_ms = time.ticks_diff(time.ticks_ms(), self._y_held_since_ms)
-            # Clamp visually so we don't overshoot the inner area while
-            # the threshold-check / state-transition is in flight.
-            progress = held_ms / _CONFIRM_HOLD_MS
-            if progress > 1.0:
-                progress = 1.0
-            elif progress < 0.0:
-                progress = 0.0
-            fill_w = int((bar_w - 2) * progress)
-            if fill_w > 0:
-                _LCD.fillRect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, _RED)
-
-        # Status text under the bar — tells the user what's happening
-        # right now (a release is otherwise silent and you'd wonder
-        # why the bar reset).
-        _LCD.setTextSize(1)
-        if self._y_held_since_ms is not None:
-            held_ms = time.ticks_diff(time.ticks_ms(), self._y_held_since_ms)
-            remaining = max(0, _CONFIRM_HOLD_MS - held_ms)
-            secs = remaining / 1000.0
-            status = "keep tapping {:.1f}s".format(secs)
-            _LCD.setTextColor(_RED, _BLACK)
-        else:
-            status = "stopped - tap faster"
-            _LCD.setTextColor(_GRAY_MID, _BLACK)
-        # Suppress the "release detected" string on first paint when
-        # the user hasn't tried yet. _y_held_since_ms is None at start
-        # too, so we differentiate via _last_y_seen_ms — if we've never
-        # seen Y, show a quiet hint instead of a misleading "release"
-        # message.
-        if self._y_held_since_ms is None and self._last_y_seen_ms is None:
-            status = "tap Y rapidly"
-            _LCD.setTextColor(_GRAY_MID, _BLACK)
-        _LCD.drawString(status, (_W - _LCD.textWidth(status)) // 2, 96)
+        # Single-press confirm: one deliberate Y press approves. The red
+        # chrome marks the irreversible-op screen, and the approve key (Y)
+        # differs from the ordinary prompt's ENTER so the gestures stay
+        # distinct. A physical press can't be injected by tool output.
+        _LCD.setTextSize(2)
+        _LCD.setTextColor(_YELLOW, _BLACK)
+        ok = "Press Y"
+        _LCD.drawString(ok, (_W - _LCD.textWidth(ok)) // 2, 64)
 
         # Hint strip — same shape as other states.
         _LCD.fillRect(0, _H - 18, _W, 18, _DARK)
         _LCD.setTextColor(_GRAY_MID, _DARK)
-        hint = "TAP Y - N/ESC cancel"
+        hint = "Y confirm - N/ESC cancel"
         _LCD.drawString(hint, (_W - _LCD.textWidth(hint)) // 2, _H - 14)
 
     def teardown(self):
@@ -1492,7 +1344,7 @@ def _speaker_power_on():
     for call in (
         lambda: (None if spk.isEnabled() else spk.begin()),
         lambda: spk.setPA(True),
-        lambda: spk.setVolume(200),
+        lambda: spk.setVolume(110),   # 0-255; kept moderate so chirps aren't shrill
     ):
         try:
             call()
