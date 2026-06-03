@@ -244,6 +244,27 @@ def _read_local_token() -> str | None:
     return None
 
 
+def _is_non_interactive() -> bool:
+    """True when stderr isn't a tty — meaning we're running headless
+    (lark-channel-bridge daemon, CI, `claude -p` pipe, etc.) and the
+    terminal-prompt fallback can't reach a human. CLI mode → False.
+    """
+    try:
+        return not os.isatty(2)
+    except (AttributeError, OSError):
+        return True
+
+
+def _maybe_fail_open(decision: str, reason: str) -> tuple[str, str]:
+    """Convert `ask` (terminal fallback) into `allow` when no terminal
+    can answer — otherwise the deferral silently denies in bridge mode.
+    Logs the original reason so the audit trail stays honest.
+    """
+    if decision == "ask" and _is_non_interactive():
+        return "allow", f"non-interactive (no tty) — fail-open; {reason}"
+    return decision, reason
+
+
 def _ask_device(title: str, danger: bool) -> tuple[str, str]:
     """POST to the daemon's /hook/confirm. Returns (decision, reason).
 
@@ -251,10 +272,14 @@ def _ask_device(title: str, danger: bool) -> tuple[str, str]:
     (device said no / ignored while reachable), or "ask" (couldn't reach the
     device, so defer to the normal terminal prompt instead of locking the
     user out). `danger` picks the gesture: hold-Y vs single Enter.
+
+    In non-interactive contexts (e.g. inside lark-channel-bridge), the
+    "ask" fallback is automatically converted to "allow" via
+    `_maybe_fail_open` — no terminal to answer = silent deny otherwise.
     """
     token = _read_local_token()
     if not token:
-        return "ask", "no bridge token; falling back to terminal prompt"
+        return _maybe_fail_open("ask", "no bridge token; falling back to terminal prompt")
     port = os.environ.get("CARDPUTER_HTTP_PORT", "9000")
     url = f"http://127.0.0.1:{port}/hook/confirm"
     payload = json.dumps(
@@ -274,9 +299,9 @@ def _ask_device(title: str, danger: bool) -> tuple[str, str]:
             data = json.loads(r.read())
     except urllib.error.URLError as e:
         # Daemon down / not listening — can't reach the gate, defer.
-        return "ask", f"ADV bridge unreachable ({e.reason}); asking in terminal"
+        return _maybe_fail_open("ask", f"ADV bridge unreachable ({e.reason}); asking in terminal")
     except Exception as e:
-        return "ask", f"ADV confirm error ({e}); asking in terminal"
+        return _maybe_fail_open("ask", f"ADV confirm error ({e}); asking in terminal")
 
     gesture = "held Y" if danger else "pressed Enter"
     if data.get("approved"):
@@ -289,7 +314,7 @@ def _ask_device(title: str, danger: bool) -> tuple[str, str]:
     # ('unavailable: ...') or the RPC stalled — treat as unreachable and
     # fall back to the terminal rather than hard-denying.
     err = str(data.get("err") or "device unavailable")
-    return "ask", f"ADV {err}; asking in terminal"
+    return _maybe_fail_open("ask", f"ADV {err}; asking in terminal")
 
 
 def main() -> None:
