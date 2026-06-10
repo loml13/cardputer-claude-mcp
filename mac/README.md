@@ -38,6 +38,21 @@ Config lives in `~/.config/cardputer-bridge/env` (user-only, never
 committed): `CARDPUTER_TOKENS`, `CARDPUTER_USAGE_INTERVAL`,
 `CARDPUTER_CCUSAGE_CMD`, etc.
 
+**Authenticating the BLE link (recommended).** The radio link has no
+bonding, so a fake peripheral in range could spoof confirm approvals.
+Provision a shared secret and the firmware signs every confirmed ack with
+HMAC-SHA256, which the daemon verifies:
+
+```bash
+SECRET=$(openssl rand -hex 32)
+mkdir -p ~/.cardputer-mcp && printf '%s' "$SECRET" > ~/.cardputer-mcp/secret
+chmod 600 ~/.cardputer-mcp/secret
+# then write the SAME string to /flash/mcp_secret.txt on the device
+# (e.g. over mpremote / Thonny), and restart the daemon
+```
+
+No secret file = legacy unsigned mode, unchanged behavior.
+
 Point local Claude Code at it:
 
 ```bash
@@ -79,6 +94,15 @@ If the Cardputer is off / out of range / the daemon isn't running, the hook
 returns `ask` — Claude Code's normal in-terminal `y/n` prompt — instead of
 blocking you. **The ADV is an optional gate, never a dependency**; with only
 a Mac, everything still works.
+
+In **headless** sessions there is no terminal to answer that fallback, so
+the hook resolves it itself: light tier → allow, danger tier → **deny**
+(fail-closed — an unreachable approval device must never make risky ops
+easier). Headless is detected only from explicit signals: `LARK_CHANNEL=1`
+(set by lark-channel-bridge) or `ADV_CONFIRM_HEADLESS=1` (set it yourself
+for CI / `claude -p` pipelines). It is deliberately not a tty sniff —
+Claude Code captures hook stderr even in interactive runs, so `isatty`
+would misread the normal CLI as headless and fail-open everywhere.
 
 ### Install
 

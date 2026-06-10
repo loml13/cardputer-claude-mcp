@@ -15,7 +15,11 @@ Policy (chosen by the user):
   - Graceful when unreachable: if the ADV is off / not carried / the bridge
     daemon isn't running, we can't get a verdict, so we fall back to "ask"
     -> Claude Code's normal in-terminal y/n prompt. You're never locked out,
-    and we never silently auto-run. Set ADV_CONFIRM_DISABLED=1 to bypass the
+    and we never silently auto-run. In explicitly headless contexts (env
+    LARK_CHANNEL=1 or ADV_CONFIRM_HEADLESS=1) where no terminal can answer,
+    the fallback resolves light-tier ops to allow and danger-tier ops to
+    deny — the gate never gets MORE permissive for risky commands just
+    because nobody is watching. Set ADV_CONFIRM_DISABLED=1 to bypass the
     hook entirely.
 
 Decision protocol: we print a PreToolUse JSON decision on stdout. "allow"
@@ -229,40 +233,73 @@ def _other_title(tool: str, tool_input: dict) -> str:
     return tool[:48]
 
 
-def _read_local_token() -> str | None:
-    """First token from CARDPUTER_TOKENS in the daemon env file."""
+def _read_env_file() -> dict:
+    """Parse the daemon env file into a {key: value} dict (quotes stripped)."""
+    out: dict = {}
     try:
         with open(ENV_PATH) as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("CARDPUTER_TOKENS="):
-                    raw = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    first = raw.split(",", 1)[0]
-                    return first.split("=", 1)[0].strip() or None
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                out[key.strip()] = val.strip().strip('"').strip("'")
     except OSError:
         pass
-    return None
+    return out
 
 
-def _is_non_interactive() -> bool:
-    """True when stderr isn't a tty — meaning we're running headless
-    (lark-channel-bridge daemon, CI, `claude -p` pipe, etc.) and the
-    terminal-prompt fallback can't reach a human. CLI mode → False.
+def _read_local_token() -> str | None:
+    """First token from CARDPUTER_TOKENS in the daemon env file."""
+    raw = _read_env_file().get("CARDPUTER_TOKENS", "")
+    first = raw.split(",", 1)[0]
+    return first.split("=", 1)[0].strip() or None
+
+
+def _bridge_port() -> str:
+    """Daemon port: process env, then the daemon env file, then 9000.
+
+    The env-file fallback matters: the hook runs in Claude Code's
+    environment, which doesn't carry the daemon's CARDPUTER_HTTP_PORT —
+    without it, changing the port in the env file silently broke the hook.
     """
-    try:
-        return not os.isatty(2)
-    except (AttributeError, OSError):
-        return True
+    return (
+        os.environ.get("CARDPUTER_HTTP_PORT")
+        or _read_env_file().get("CARDPUTER_HTTP_PORT")
+        or "9000"
+    )
 
 
-def _maybe_fail_open(decision: str, reason: str) -> tuple[str, str]:
-    """Convert `ask` (terminal fallback) into `allow` when no terminal
-    can answer — otherwise the deferral silently denies in bridge mode.
-    Logs the original reason so the audit trail stays honest.
+def _is_headless() -> bool:
+    """True only on EXPLICIT headless signals: LARK_CHANNEL=1 (set by
+    lark-channel-bridge sessions) or ADV_CONFIRM_HEADLESS=1 (set it
+    yourself for CI / `claude -p` pipelines).
+
+    Deliberately NOT a tty sniff: Claude Code captures hook stderr even in
+    interactive runs, so `os.isatty(2)` reads headless everywhere and
+    would fail-open in the normal CLI too. Unknown context → treated as
+    interactive, i.e. fail-closed.
     """
-    if decision == "ask" and _is_non_interactive():
-        return "allow", f"non-interactive (no tty) — fail-open; {reason}"
-    return decision, reason
+    return (
+        os.environ.get("LARK_CHANNEL") == "1"
+        or os.environ.get("ADV_CONFIRM_HEADLESS") == "1"
+    )
+
+
+def _maybe_fail_open(decision: str, reason: str, danger: bool) -> tuple[str, str]:
+    """Resolve the `ask` (terminal fallback) verdict for headless contexts,
+    where there is no terminal to answer and `ask` silently denies.
+
+    Light tier fails OPEN (ordinary commands shouldn't wedge a headless
+    pipeline). Danger tier fails CLOSED — an unreachable approval device
+    must never get more permissive for exactly the ops it exists to gate.
+    Both keep the original reason so the audit trail stays honest.
+    """
+    if decision != "ask" or not _is_headless():
+        return decision, reason
+    if danger:
+        return "deny", f"headless + ADV unreachable — risky op denied (fail-closed); {reason}"
+    return "allow", f"headless + ADV unreachable — fail-open (light tier); {reason}"
 
 
 def _ask_device(title: str, danger: bool) -> tuple[str, str]:
@@ -271,17 +308,19 @@ def _ask_device(title: str, danger: bool) -> tuple[str, str]:
     decision is a PreToolUse verdict: "allow" (approved on device), "deny"
     (device said no / ignored while reachable), or "ask" (couldn't reach the
     device, so defer to the normal terminal prompt instead of locking the
-    user out). `danger` picks the gesture: hold-Y vs single Enter.
+    user out). `danger` picks the gesture: Y vs Enter.
 
-    In non-interactive contexts (e.g. inside lark-channel-bridge), the
-    "ask" fallback is automatically converted to "allow" via
-    `_maybe_fail_open` — no terminal to answer = silent deny otherwise.
+    In headless contexts (LARK_CHANNEL=1 / ADV_CONFIRM_HEADLESS=1) the
+    "ask" fallback is resolved by `_maybe_fail_open`: light tier → allow,
+    danger tier → deny. There's no terminal to answer, and the danger tier
+    must never fail open.
     """
     token = _read_local_token()
     if not token:
-        return _maybe_fail_open("ask", "no bridge token; falling back to terminal prompt")
-    port = os.environ.get("CARDPUTER_HTTP_PORT", "9000")
-    url = f"http://127.0.0.1:{port}/hook/confirm"
+        return _maybe_fail_open(
+            "ask", "no bridge token; falling back to terminal prompt", danger
+        )
+    url = f"http://127.0.0.1:{_bridge_port()}/hook/confirm"
     payload = json.dumps(
         {"title": title, "timeout_s": CONFIRM_TIMEOUT_S, "danger": danger}
     ).encode()
@@ -299,11 +338,15 @@ def _ask_device(title: str, danger: bool) -> tuple[str, str]:
             data = json.loads(r.read())
     except urllib.error.URLError as e:
         # Daemon down / not listening — can't reach the gate, defer.
-        return _maybe_fail_open("ask", f"ADV bridge unreachable ({e.reason}); asking in terminal")
+        return _maybe_fail_open(
+            "ask", f"ADV bridge unreachable ({e.reason}); asking in terminal", danger
+        )
     except Exception as e:
-        return _maybe_fail_open("ask", f"ADV confirm error ({e}); asking in terminal")
+        return _maybe_fail_open(
+            "ask", f"ADV confirm error ({e}); asking in terminal", danger
+        )
 
-    gesture = "held Y" if danger else "pressed Enter"
+    gesture = "pressed Y" if danger else "pressed Enter"
     if data.get("approved"):
         return "allow", f"approved on ADV ({gesture})"
     if data.get("cancelled"):
@@ -314,7 +357,7 @@ def _ask_device(title: str, danger: bool) -> tuple[str, str]:
     # ('unavailable: ...') or the RPC stalled — treat as unreachable and
     # fall back to the terminal rather than hard-denying.
     err = str(data.get("err") or "device unavailable")
-    return _maybe_fail_open("ask", f"ADV {err}; asking in terminal")
+    return _maybe_fail_open("ask", f"ADV {err}; asking in terminal", danger)
 
 
 def main() -> None:
