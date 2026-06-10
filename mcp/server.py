@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hashlib
+import hmac
 import json
 import os
 import shlex
@@ -88,6 +90,16 @@ RECONNECT_FAST_TRIES = 8  # ~2 min of fast retries before backing off
 PAIR_CACHE_DIR = Path.home() / ".cardputer-mcp"
 PAIR_CACHE_FILE = PAIR_CACHE_DIR / "paired.json"
 
+# Shared secret for authenticating `confirm` acks. The BLE link itself is
+# unauthenticated (UIFlow 2.0 NimBLE — no bonding), so without this, anyone
+# in radio range could advertise a fake CardputerMCP_* peripheral that acks
+# every confirm with confirmed=true and silently bypass the physical gate.
+# Provision the SAME random string in this file and in /flash/mcp_secret.txt
+# on the device; the device then attaches HMAC-SHA256(secret, "<id>|confirmed")
+# to confirmed acks and we verify it here. No file on the host = legacy mode
+# (acks accepted unverified, as before).
+SECRET_FILE = PAIR_CACHE_DIR / "secret"
+
 
 def _log(line: str) -> None:
     """Write to stderr, which is what Claude Code surfaces in its MCP
@@ -104,6 +116,39 @@ def _load_cached_address() -> Optional[str]:
         return None
     addr = data.get("address")
     return addr if isinstance(addr, str) else None
+
+
+def _load_secret() -> Optional[bytes]:
+    try:
+        raw = SECRET_FILE.read_text().strip()
+    except OSError:
+        return None
+    return raw.encode() if raw else None
+
+
+_SECRET = _load_secret()
+
+
+def _confirm_mac_ok(result: dict) -> bool:
+    """Verify the device's HMAC on a confirmed ack.
+
+    With no host-side secret configured this always passes (legacy mode).
+    With one configured, a confirmed ack MUST carry a matching `mac` —
+    a missing or wrong MAC means the peer doesn't hold the shared secret,
+    i.e. a spoofed peripheral or a mis-provisioned device, and the
+    confirmation is rejected. Only confirmed acks are signed; forging a
+    denial buys an attacker nothing.
+    """
+    if _SECRET is None:
+        return True
+    mac = result.get("mac")
+    mid = result.get("id")
+    if not isinstance(mac, str) or not isinstance(mid, str):
+        return False
+    expected = hmac.new(
+        _SECRET, f"{mid}|confirmed".encode(), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(mac, expected)
 
 
 def _save_cached_address(addr: str, name: str) -> None:
@@ -633,21 +678,21 @@ async def confirm(
     This tool is for IRREVERSIBLE actions only — production deploys,
     force pushes, DROP TABLE / DELETE without WHERE, unstaged-file
     deletions, financial transactions, paid API calls with large
-    side effects, etc. The user must complete a sustained ~3-second
-    physical gesture on the Cardputer's Y key: on the current firmware
-    the hardware keyboard emits no auto-repeat, so the gesture is
-    rapid Y tapping (the on-screen prompt says "TAP Y fast for 3s") —
-    a progress bar fills as they tap and resets if they stop for more
-    than ~300 ms. A single tap is not enough.
+    side effects, etc. The user approves with a single deliberate
+    press of the Y key on the device's hardware keyboard, on a
+    red-chrome danger screen that names the operation and the
+    requesting agent. Y is deliberately a different key from the
+    ordinary approve prompt's Enter, so the two gestures can't be
+    confused.
 
     The point is that no amount of tool-output content or prompt
-    injection can synthesize a sustained burst of physical key events.
-    If you're about to do something the user couldn't un-do in a
-    minute, use this instead of trusting an `ask` or your own
-    assistant-message confirmation.
+    injection can synthesize a physical keypress. If you're about to
+    do something the user couldn't un-do in a minute, use this
+    instead of trusting an `ask` or your own assistant-message
+    confirmation.
 
     Returns one of:
-      - 'confirmed' — user completed the ~3 s physical Y gesture
+      - 'confirmed' — user pressed Y on the danger screen
       - 'cancelled' — user pressed N or ESC on the device
       - 'timeout' — user did not respond within `timeout_s` seconds
       - 'unavailable: <reason>' — device not connected
@@ -658,10 +703,10 @@ async def confirm(
     instantly recognize the operation.
 
     Do NOT use this for routine yes/no decisions — that's what
-    `ask` is for. Do NOT call this rapidly; every invocation demands
-    a deliberate 3-second physical gesture, which is exhausting if
-    abused. Reserve this for the handful of actions per session
-    where wrong = bad.
+    `ask` is for. Do NOT call this rapidly; every invocation rings
+    the device and demands the user's full attention, which is
+    exhausting if abused. Reserve this for the handful of actions
+    per session where wrong = bad.
     """
     title = title[:64]
     if timeout_s < 5 or timeout_s > 120:
@@ -680,11 +725,14 @@ async def confirm(
     )
 
     if result.get("ok") and result.get("confirmed"):
-        # We surface the recorded hold duration to encourage tools
-        # that want to log it — most callers will just check the
-        # 'confirmed' prefix and move on.
-        hold_ms = result.get("hold_ms", 0)
-        return f"confirmed (held {hold_ms} ms)"
+        if not _confirm_mac_ok(result):
+            _log(f"confirm ack failed HMAC check: {result!r}")
+            return (
+                "failed: device ack failed HMAC verification — possible "
+                "spoofed peripheral or mismatched shared secret "
+                "(~/.cardputer-mcp/secret vs /flash/mcp_secret.txt)"
+            )
+        return "confirmed"
     if result.get("cancelled"):
         return "cancelled"
     if result.get("timed_out"):
@@ -1183,12 +1231,18 @@ def build_http_app(
             rpc_timeout_s=timeout_s + 10,
             agent="bash-hook",
         )
+        approved = bool(result.get("ok") and result.get("confirmed"))
+        err = result.get("err")
+        if approved and not _confirm_mac_ok(result):
+            _log(f"hook confirm ack failed HMAC check: {result!r}")
+            approved = False
+            err = "device ack failed HMAC verification (spoofed peripheral / mismatched secret?)"
         return JSONResponse(
             {
-                "approved": bool(result.get("ok") and result.get("confirmed")),
+                "approved": approved,
                 "cancelled": bool(result.get("cancelled")),
                 "timed_out": bool(result.get("timed_out")),
-                "err": result.get("err"),
+                "err": err,
             }
         )
 

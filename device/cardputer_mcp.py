@@ -59,9 +59,51 @@ _RX_CHAR = (RX_UUID, _FLAG_WRITE | _FLAG_WRITE_NR)
 _TX_CHAR = (TX_UUID, _FLAG_READ | _FLAG_NOTIFY)
 _SVC = (SERVICE_UUID, (_RX_CHAR, _TX_CHAR))
 
-_FW_VERSION = "0.4.0"
+_FW_VERSION = "0.4.1"
 _CAPS = ["notify", "ask", "confirm", "usage", "sense"]
 _MTU = 20  # default ATT MTU minus framing; chunk every TX write at this
+
+# Shared secret for signing confirm acks. The BLE link is unauthenticated
+# (no bonding on this NimBLE build), so without a MAC anyone in radio range
+# could spoof a peripheral — or spoof acks — and "approve" a destructive op.
+# Provision the same random string here and in ~/.cardputer-mcp/secret on
+# the host; confirmed acks then carry HMAC-SHA256(secret, "<id>|confirmed").
+# No file = legacy mode (unsigned acks; host accepts them only if IT has no
+# secret either).
+_SECRET_PATH = "/flash/mcp_secret.txt"
+
+
+def _load_secret():
+    try:
+        with open(_SECRET_PATH) as f:
+            raw = f.read().strip()
+        return raw.encode() if raw else None
+    except Exception:
+        return None
+
+
+_SECRET = _load_secret()
+
+
+def _hmac_sha256_hex(key, msg):
+    """HMAC-SHA256 (RFC 2104) over uhashlib — MicroPython has no hmac
+    module. Key/msg are bytes; returns lowercase hex."""
+    try:
+        import uhashlib as _hl
+    except ImportError:
+        import hashlib as _hl
+    import binascii
+
+    if len(key) > 64:
+        key = _hl.sha256(key).digest()
+    ipad = bytearray(64)
+    opad = bytearray(64)
+    for i in range(64):
+        b = key[i] if i < len(key) else 0
+        ipad[i] = b ^ 0x36
+        opad[i] = b ^ 0x5C
+    inner = _hl.sha256(bytes(ipad) + msg).digest()
+    return binascii.hexlify(_hl.sha256(bytes(opad) + inner).digest()).decode()
 
 # ---- physical-sense tuning -----------------------------------------
 # Cardputer-Adv has a BMI270 6-axis IMU and a battery gauge we read
@@ -324,16 +366,20 @@ class MCPBLE:
         # would just produce a misleading "notify failed" log.
         if self._conn is None or self._shutting_down:
             return
-        self.send(
-            {
-                "event": "hello",
-                "version": _FW_VERSION,
-                "name": "Cardputer",
-                "caps": _CAPS,
-                "model": "cardputer-adv",
-                "mtu": _MTU,
-            }
-        )
+        hello = {
+            "event": "hello",
+            "version": _FW_VERSION,
+            "name": "Cardputer",
+            "caps": _CAPS,
+            "model": "cardputer-adv",
+            "mtu": _MTU,
+        }
+        if _SECRET:
+            # Advertise that confirm acks from this firmware are signed,
+            # so the host can tell "no secret provisioned" from "older
+            # firmware" when diagnosing a MAC failure.
+            hello["sec"] = "hmac1"
+        self.send(hello)
 
     def send(self, payload):
         """Push one JSON object to the host as one `\\n`-terminated
@@ -746,15 +792,20 @@ class App:
                 danger = self.pending_confirm.get("danger", True)
                 approve = (ord("y"), ord("Y")) if danger else (0x0A, 0x0D, ord("y"), ord("Y"))
                 if k in approve:
-                    self.ble.send(
-                        {
-                            "ack": "confirm",
-                            "id": self.pending_confirm["id"],
-                            "ok": True,
-                            "confirmed": True,
-                            "hold_ms": 0,
-                        }
-                    )
+                    cid = self.pending_confirm["id"]
+                    ack = {
+                        "ack": "confirm",
+                        "id": cid,
+                        "ok": True,
+                        "confirmed": True,
+                    }
+                    if _SECRET:
+                        # Sign the approval so a spoofed peripheral (the BLE
+                        # link itself is unauthenticated) can't forge it.
+                        ack["mac"] = _hmac_sha256_hex(
+                            _SECRET, (cid + "|confirmed").encode()
+                        )
+                    self.ble.send(ack)
                     self.pending_confirm = None
                     self.state = "idle"
                     self._dirty = True

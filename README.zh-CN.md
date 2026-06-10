@@ -61,6 +61,17 @@ mac/README.md             Mac 端安装与调优说明  ← 从这里开始
 桥接对每个 HTTP 请求都做 bearer-token 鉴权;token 只存在
 `~/.config/cardputer-bridge/env`(从不提交)。设备上的物理 Y 键确认是不可逆操作的信任锚。
 
+**BLE 威胁模型。**BLE 链路本身没有认证(此 NimBLE 构建不支持配对绑定),
+无线范围内的攻击者可以广播一个伪造的 `CardputerMCP_*` 外设并对所有 confirm
+自动回"已确认"。堵上这个口子的方法是配置共享密钥:把同一串足够长的随机字符串
+分别写入 `~/.cardputer-mcp/secret`(Mac)和 `/flash/mcp_secret.txt`(设备)。
+之后固件会用 HMAC-SHA256 给确认 ack 签名,桥接拒绝任何校验不通过的批准。
+两侧都不配密钥则保持旧的无签名模式 —— 在自己桌上没问题,共享办公环境不建议。
+
+**无人值守会话。**在没有终端可以应答回退提示的上下文里(env `LARK_CHANNEL=1`
+或 `ADV_CONFIRM_HEADLESS=1`),设备不可达时:轻量档批准放行(*allow*),
+危险档直接拒绝(*deny*)—— 审批门永远不会因为没人盯着就对危险命令更宽松。
+
 ## 致谢
 
 - 基于 [cardputer-claude-os](https://github.com/dakshaymehta/cardputer-claude-os) —— 本项目所扩展的 Cardputer ↔ Claude BLE 套件。

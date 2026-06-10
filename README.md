@@ -69,6 +69,22 @@ The bridge gates every HTTP request behind a bearer token; tokens live only
 in `~/.config/cardputer-bridge/env` (never committed). A physical Y press on
 the device is the trust anchor for irreversible operations.
 
+**BLE threat model.** The BLE link itself is unauthenticated (this NimBLE
+build has no bonding), so a hostile neighbor in radio range could advertise
+a fake `CardputerMCP_*` peripheral that acks every confirm. To close that
+hole, provision a shared secret: write the same long random string to
+`~/.cardputer-mcp/secret` (Mac) and `/flash/mcp_secret.txt` (device). The
+firmware then signs confirmed acks with HMAC-SHA256 and the bridge rejects
+any approval that doesn't verify. With no secret on either side, behavior
+is the legacy unsigned mode — fine on a desk you trust, not in a shared
+office.
+
+**Headless sessions.** In contexts with no terminal to answer a fallback
+prompt (env `LARK_CHANNEL=1` or `ADV_CONFIRM_HEADLESS=1`), an unreachable
+device resolves light-tier approvals to *allow* and danger-tier ones to
+*deny* — the gate never gets more permissive for risky commands just
+because nobody is watching.
+
 ## Acknowledgements
 
 - Built on [cardputer-claude-os](https://github.com/dakshaymehta/cardputer-claude-os) — the Cardputer ↔ Claude BLE bundle this extends.
