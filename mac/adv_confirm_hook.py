@@ -8,8 +8,10 @@ if so, push it to the ADV via the bridge daemon's /hook/confirm route. The
 user approves with the physical ~3s Y-hold gesture on the device.
 
 Policy (chosen by the user):
-  - Scope: only risky commands are gated; everything else proceeds through
-    Claude Code's normal permission flow (we emit no decision for those).
+  - Scope, three tiers: whitelisted read-only Bash and ordinary file edits
+    pass silently; ordinary Bash commands get the light Enter approve on the
+    ADV; risky Bash (RISKY_PATTERNS) and sensitive-path edits
+    (SENSITIVE_PATTERNS) demand the Y danger confirm.
   - Gate when reachable: the device decides. Hold Y -> allow; press N/ESC
     or just ignore the prompt until it times out -> DENY.
   - Graceful when unreachable: if the ADV is off / not carried / the bridge
@@ -45,10 +47,11 @@ SENSITIVE_OVERRIDE = os.path.expanduser("~/.config/cardputer-bridge/sensitive_pa
 # settings.json must list these too, or the hook never fires for them.
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
-# Other built-in tools with outside-world side effects. When the ADV is
-# connected these route their would-be terminal confirmation to it; when it
-# isn't, they fall back to the terminal. Read-only tools (Read/Grep/Glob/LS)
-# are deliberately NOT in the matcher, so the hook never fires for them.
+# Other built-in tools with outside-world side effects. Currently NOT in the
+# settings.json matcher (user policy: only risky bash / sensitive edits are
+# gated), so these branches are dormant — re-add the tools to the matcher to
+# route them to the ADV again. Read-only tools (Read/Grep/Glob/LS) are
+# deliberately never matched.
 EFFECTFUL_TOOLS = {"WebFetch", "WebSearch", "Task", "KillShell"}
 
 # MCP tools are matched via "mcp__.*" in settings.json. We can't know each
@@ -369,19 +372,26 @@ def main() -> None:
     except Exception:
         _defer()
 
+    # Auto mode (e.g. plan accepted with "auto") and the explicit no-prompt
+    # modes: the user already delegated approval wholesale, so the ADV stays
+    # quiet and Claude Code's own auto classifier handles everything
+    # silently. Default/acceptEdits modes still go through the gate.
+    if event.get("permission_mode") in ("auto", "bypassPermissions", "dontAsk"):
+        _defer()
+
     tool = event.get("tool_name")
     tool_input = event.get("tool_input") or {}
 
     # File edits: sensitive paths (.env / keys / system dirs) demand the
-    # hold-Y gesture; every other edit gets the light single-Enter approve.
-    # No pass-through tier — when the ADV is around, all edits go through it;
-    # when it isn't, _ask_device returns "ask" and the terminal handles it.
+    # hold-Y gesture on the ADV; every other edit is auto-allowed silently.
     if tool in EDIT_TOOLS:
         title, path = _edit_title(tool, tool_input)
         if not path:
             _defer()
-        decision, reason = _ask_device(title, danger=_is_sensitive(path))
-        _emit(decision, reason)
+        if _is_sensitive(path):
+            decision, reason = _ask_device(title, danger=True)
+            _emit(decision, reason)
+        _emit("allow", "ordinary file edit — auto-allowed")
 
     if tool == "Bash":
         command = tool_input.get("command", "")
@@ -390,8 +400,8 @@ def main() -> None:
 
         # Bash, three tiers. Risky is checked FIRST so a chained dangerous
         # command (e.g. "ls && rm -rf x") can't slip through the whitelist.
-        #   risky  -> ADV hold-Y    (irreversible ops)
-        #   safe   -> pass through  (no prompt at all)
+        #   risky  -> ADV Y confirm     (irreversible ops)
+        #   safe   -> pass through      (no prompt at all)
         #   else   -> ADV light Enter approve (ordinary commands)
         # Unreachable device falls back to the terminal in either ADV tier.
         title = command.strip().replace("\n", " ")[:48]
