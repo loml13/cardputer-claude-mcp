@@ -372,11 +372,12 @@ def main() -> None:
     except Exception:
         _defer()
 
-    # Auto mode (e.g. plan accepted with "auto") and the explicit no-prompt
-    # modes: the user already delegated approval wholesale, so the ADV stays
-    # quiet and Claude Code's own auto classifier handles everything
-    # silently. Default/acceptEdits modes still go through the gate.
-    if event.get("permission_mode") in ("auto", "bypassPermissions", "dontAsk"):
+    # Modes where the gate adds nothing but noise: auto (e.g. plan accepted
+    # with "auto") and the explicit no-prompt modes mean the user already
+    # delegated approval wholesale; plan mode is read-only by construction
+    # (Claude Code blocks writes itself, so buzzing for exploratory commands
+    # is pure friction). Default/acceptEdits modes still go through the gate.
+    if event.get("permission_mode") in ("auto", "bypassPermissions", "dontAsk", "plan"):
         _defer()
 
     tool = event.get("tool_name")
